@@ -85,7 +85,6 @@ def create_channel_entry(pv_name, tags, cf_service_url, username, password):
         "lower_ctrl_limit": pv.lower_ctrl_limit,
         "lower_disp_limit": pv.lower_disp_limit,
         "lower_warning_limit": pv.lower_warning_limit,
-        "info": pv.info,
         "severity": pv.severity,
         "timestamp": pv.timestamp,
         "units": pv.units,
