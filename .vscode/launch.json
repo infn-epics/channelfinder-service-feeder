@@ -14,7 +14,7 @@
             "program": "cfeeder.py",
             "console": "integratedTerminal",
             "python": "${workspaceFolder}/venv/bin/python",
-            "args":["/Users/andreamichelotti/mnt/config","http://sparc-channelfinder.apps.okd-datest.lnf.infn.it/ChannelFinder","admin","adminPass"],
+            "args":["/Users/andreamichelotti/mnt","http://sparc-channelfinder.apps.okd-datest.lnf.infn.it/ChannelFinder","admin","adminPass"],
             "justMyCode": true,
             "env": {
                 "EPICS_CA_ADDR_LIST": "192.168.36.201",

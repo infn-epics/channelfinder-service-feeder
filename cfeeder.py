@@ -4,8 +4,15 @@ import argparse
 import os
 import requests
 import epics
+import logging,time
+logging.basicConfig(
+    format='%(asctime)s %(levelname)-8s %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S')
 
+logger = logging.getLogger(__name__)
 # List of EPICS fields to extract
+
 epics_fields = [
     "DESC", "ASG", "SCAN", "PINI", "PHAS", "EVNT", "TSE", "TSEL", "DTYP", "DISV", "DISA", "SDIS", "MLOK", "MLIS",
     "FLNK", "VAL", "OUT", "HIGH", "HIHI", "LOW", "LOLO", "HOPR", "LOPR", "DRVH", "DRVL", "EGU", "PREC", "ADEL", "MDEL",
@@ -31,9 +38,9 @@ def create_property_if_not_exists(cf_service_url, property_name, username, passw
         )
         
         if create_response.status_code == 200:
-            print(f"Successfully created property: {property_name}")
+            logger.info(f"Successfully created property: {property_name}")
         else:
-            print(f"Failed to create property: {property_name}. Status code: {create_response.status_code}, Response: {create_response.text}")
+            logger.error(f"Failed to create property: {property_name}. Status code: {create_response.status_code}, Response: {create_response.text}")
     
 
 def create_tag_if_not_exists(cf_service_url, tag, username, password):
@@ -54,18 +61,40 @@ def create_tag_if_not_exists(cf_service_url, tag, username, password):
         )
         
         if create_response.status_code == 200:
-            print(f"Successfully created tag: {tag}")
+            logger.info(f"Successfully created tag: {tag}")
         else:
-            print(f"Failed to create tag: {tag}. Status code: {create_response.status_code}, Response: {create_response.text}")
+            logger.error(f"Failed to create tag: {tag}. Status code: {create_response.status_code}, Response: {create_response.text}")
    
-
 def create_channel_entry(pv_name, tags, cf_service_url, username, password):
+    # Get PV information using pyepics
+
+    # Define the channel data with required properties and EPICS fields
+    channel_data = {
+        "name": pv_name,
+        "owner": username,  # Assuming the username is the owner
+        "properties":[],
+        "tags": [{"name": tag} for tag in tags]
+    }
+
+    # Send a POST request to the Channel Finder Service to create the channel entry
+    response = requests.post(
+        f"{cf_service_url}/resources/channels",
+        json=[channel_data],  # The API expects a list of channels
+        auth=(username, password)
+    )
+
+    if response.status_code == 200:
+        logger.info(f"Successfully created channel entry for PV: {pv_name}")
+    else:
+        logger.error(f"Failed to create channel entry for PV: {pv_name}. Status code: {response.status_code}, Response: {response.text}, body:{str(channel_data)}")
+
+def create_full_channel_entry(pv_name, tags, cf_service_url, username, password):
     # Get PV information using pyepics
     pv = epics.PV(pv_name)
     
     # Wait for PV connection
     if not pv.wait_for_connection(timeout=5):
-        print(f"Failed to connect to PV: {pv_name}")
+        logger.error(f"Failed to connect to PV: {pv_name}")
         return
     
     # Fetch additional PV information including EPICS fields
@@ -99,7 +128,7 @@ def create_channel_entry(pv_name, tags, cf_service_url, username, password):
     #         value = pv.get(field)
     #         pv_fields[field] = value
     #     except Exception as e:
-    #         print(f"Failed to fetch field \"{field}\" for PV {pv_name}: {e}")
+    #         logger.info(f"Failed to fetch field \"{field}\" for PV {pv_name}: {e}")
 
     # Define the required properties
     
@@ -133,11 +162,11 @@ def create_channel_entry(pv_name, tags, cf_service_url, username, password):
     )
 
     if response.status_code == 200:
-        print(f"Successfully created channel entry for PV: {pv_name}")
+        logger.info(f"Successfully created full channel entry for PV: {pv_name}")
     else:
-        print(f"Failed to create channel entry for PV: {pv_name}. Status code: {response.status_code}, Response: {response.text}")
+        logger.error(f"Failed to create FULL channel entry for PV: {pv_name}. Status code: {response.status_code}, Response: {response.text}, body:{str(channel_data)}")
 
-def process_directory(config_dir, cf_service_url, username, password):
+def process_directory(config_dir, cf_service_url, username, password, fn):
     for root, dirs, files in os.walk(config_dir):
         for dir_name in dirs:
             pvlist_path = os.path.join(root, dir_name, 'pvlist.txt')
@@ -145,7 +174,9 @@ def process_directory(config_dir, cf_service_url, username, password):
                 with open(pvlist_path, 'r') as pv_file:
                     pv_names = [line.strip() for line in pv_file if line.strip()]
                     for pv_name in pv_names:
-                        create_channel_entry(pv_name, [dir_name], cf_service_url, username, password)
+                        fn(pv_name, [dir_name], cf_service_url, username, password)
+                   
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Create Channel Finder entries for PVs listed in pvlist.txt files within a directory structure.')
@@ -156,4 +187,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    process_directory(args.config_dir, args.cf_service_url, args.username, args.password)
+    process_directory(args.config_dir, args.cf_service_url, args.username, args.password,create_channel_entry)
+    process_directory(args.config_dir, args.cf_service_url, args.username, args.password,create_full_channel_entry)
+
