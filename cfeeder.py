@@ -1,6 +1,6 @@
 ## Andrea Michelotti
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 
 import argparse
 import os
@@ -115,7 +115,15 @@ def load_ioc_metadata(pvlist_dir, ioc_name):
     try:
         with open(config_path, 'r') as f:
             data = yaml.safe_load(f) or {}
-        return {k: str(data[k]) for k in IOC_METADATA_KEYS if k in data and data[k] is not None}
+        result = {}
+        for k in IOC_METADATA_KEYS:
+            if k in data and data[k] is not None:
+                v = data[k]
+                if isinstance(v, list):
+                    result[k] = ",".join(str(x) for x in v)
+                else:
+                    result[k] = str(v)
+        return result
     except Exception as e:
         logger.warning(f"Error reading {config_path}: {e}")
         return {}
