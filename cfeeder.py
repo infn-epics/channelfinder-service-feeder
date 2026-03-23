@@ -383,8 +383,8 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner,
     # Timestamp for staleness tracking
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Use devgroup as the channel owner (falls back to the service account)
-    channel_owner = ioc_meta.get("devgroup", owner)
+    # Channel owner must match the authenticated user for authorization
+    channel_owner = owner
 
     # Load PV list from file
     pv_names = load_pvlist(pvlist_dir, ioc_name)
