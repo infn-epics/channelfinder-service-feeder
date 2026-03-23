@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 # IOC metadata keys to store as ChannelFinder properties
 IOC_METADATA_KEYS = [
     "beamline", "devgroup", "devtype", "host", "ioc_version",
-    "ca_server_port", "pva_server_port", "pva", "asset"
+    "ca_server_port", "pva_server_port", "pva", "asset", "zone",
+    "ioc_start_time"
 ]
 
 
@@ -120,6 +121,31 @@ def load_ioc_metadata(pvlist_dir, ioc_name):
         return {}
 
 
+def parse_start_log(pvlist_dir, ioc_name):
+    """Parse <pvlist_dir>/<ioc_name>/start.log to extract ioc_version and ioc_start_time.
+
+    Expected format (key: value lines):
+        Start Date: Sun Mar 15 02:15:35 UTC 2026
+        IOC Version: v26.3.14
+    Returns a dict with zero or more of: ioc_version, ioc_start_time.
+    """
+    log_path = os.path.join(pvlist_dir, ioc_name, "start.log")
+    result = {}
+    if not os.path.isfile(log_path):
+        return result
+    try:
+        with open(log_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("IOC Version:"):
+                    result["ioc_version"] = line.split(":", 1)[1].strip()
+                elif line.startswith("Start Date:"):
+                    result["ioc_start_time"] = line.split(":", 1)[1].strip()
+    except Exception as e:
+        logger.warning(f"Error reading {log_path}: {e}")
+    return result
+
+
 def load_pvlist(pvlist_dir, ioc_name):
     """Load PV names from <pvlist_dir>/<ioc_name>/pvlist.txt."""
     pvlist_path = os.path.join(pvlist_dir, ioc_name, "pvlist.txt")
@@ -127,7 +153,7 @@ def load_pvlist(pvlist_dir, ioc_name):
         logger.warning(f"No pvlist.txt found for IOC {ioc_name} at {pvlist_path}")
         return []
     with open(pvlist_path, 'r') as f:
-        return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        return [line.strip().strip(',') for line in f if line.strip() and not line.startswith('#')]
 
 
 # ---------------------------------------------------------------------------
@@ -178,8 +204,15 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
                 if k not in ioc_meta and k in default_vals and default_vals[k] is not None:
                     ioc_meta[k] = str(default_vals[k])
 
+    # Merge start.log data — overrides yaml for ioc_version, adds ioc_start_time
+    start_log = parse_start_log(pvlist_dir, ioc_name)
+    ioc_meta.update(start_log)
+
     # Always set iocName property
     ioc_meta["iocName"] = ioc_name
+
+    # Use devgroup as the channel owner (falls back to the service account)
+    channel_owner = ioc_meta.get("devgroup", owner)
 
     # Determine if PVA is available for this IOC
     ioc_pva = ioc_meta.get("pva", "false").lower() == "true"
@@ -197,19 +230,21 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
     for prop_name in all_prop_names:
         ensure_property(cf_url, prop_name, owner, auth)
 
-    # Tag with IOC name and devgroup
+    # Tag with IOC name, devgroup, beamline, and zone
     tags = [ioc_name]
     if "devgroup" in ioc_meta:
         tags.append(ioc_meta["devgroup"])
     if "beamline" in ioc_meta:
         tags.append(ioc_meta["beamline"])
+    if "zone" in ioc_meta:
+        tags.append(ioc_meta["zone"])
     for tag in tags:
         ensure_tag(cf_url, tag, owner, auth)
 
     # Build channel entries
     channels = []
     for pv_name in pv_names:
-        properties = [{"name": k, "owner": owner, "value": v} for k, v in ioc_meta.items()]
+        properties = [{"name": k, "owner": channel_owner, "value": v} for k, v in ioc_meta.items()]
 
         # Try PVA introspection if the IOC supports PVA
         pv_protocol = "ca"
@@ -217,16 +252,16 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
             info = pvinfo(pv_name, timeout=pva_timeout)
             if info:
                 pv_protocol = "pva"
-                properties.append({"name": "pvinfo", "owner": owner, "value": info["pvinfo"][:500]})
+                properties.append({"name": "pvinfo", "owner": channel_owner, "value": info["pvinfo"][:500]})
                 ensure_property(cf_url, "pvinfo", owner, auth)
 
-        properties.append({"name": "pvProtocol", "owner": owner, "value": pv_protocol})
+        properties.append({"name": "pvProtocol", "owner": channel_owner, "value": pv_protocol})
 
         channel = {
             "name": pv_name,
-            "owner": owner,
+            "owner": channel_owner,
             "properties": properties,
-            "tags": [{"name": t, "owner": owner} for t in tags]
+            "tags": [{"name": t, "owner": channel_owner} for t in tags]
         }
         channels.append(channel)
 
