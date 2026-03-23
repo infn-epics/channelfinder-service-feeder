@@ -70,7 +70,7 @@ def post_channels(cf_url, channels, auth):
 # PVA introspection via pvinfo (EPICS base CLI)
 # ---------------------------------------------------------------------------
 
-def pvinfo(pv_name, timeout=3):
+def pvinfo(pv_name, timeout=0.5):
     """Run pvinfo on a PV and return parsed structure info as a dict.
     Returns None if pvinfo fails or is unavailable."""
     try:
@@ -214,16 +214,13 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
     # Use devgroup as the channel owner (falls back to the service account)
     channel_owner = ioc_meta.get("devgroup", owner)
 
-    # Determine if PVA is available for this IOC
-    ioc_pva = ioc_meta.get("pva", "false").lower() == "true"
-
     # Load PV list from file
     pv_names = load_pvlist(pvlist_dir, ioc_name)
     if not pv_names:
         logger.warning(f"No PVs found for IOC {ioc_name}, skipping")
         return
 
-    logger.info(f"  IOC {ioc_name}: {len(pv_names)} PVs, pva={ioc_pva}, meta={ioc_meta}")
+    logger.info(f"  IOC {ioc_name}: {len(pv_names)} PVs, meta={ioc_meta}")
 
     # Ensure properties and tags exist in ChannelFinder
     all_prop_names = set(ioc_meta.keys()) | {"pvProtocol"}
@@ -246,9 +243,10 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
     for pv_name in pv_names:
         properties = [{"name": k, "owner": channel_owner, "value": v} for k, v in ioc_meta.items()]
 
-        # Try PVA introspection if the IOC supports PVA
+        # Try PVA introspection — protocol is pva if pvinfo succeeds, ca otherwise
+        # Skip only when pva is explicitly set to false in IOC metadata
         pv_protocol = "ca"
-        if use_pva and ioc_pva:
+        if use_pva and ioc_meta.get("pva", "").lower() != "false":
             info = pvinfo(pv_name, timeout=pva_timeout)
             if info:
                 pv_protocol = "pva"
@@ -295,8 +293,8 @@ def main():
                         help='Process only this IOC name (default: all IOCs with pvlist.txt)')
     parser.add_argument('--no-pva', action='store_true',
                         help='Skip PVA introspection even if IOC supports it')
-    parser.add_argument('--pva-timeout', type=int, default=3,
-                        help='Timeout in seconds for pvinfo/pvget (default: 3)')
+    parser.add_argument('--pva-timeout', type=float, default=0.5,
+                        help='Timeout in seconds for pvinfo (default: 0.5)')
     parser.add_argument('--batch-size', type=int, default=100,
                         help='Number of channels per POST batch (default: 100)')
 
