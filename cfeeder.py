@@ -1,6 +1,6 @@
 ## Andrea Michelotti
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 
 import argparse
 import os
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 IOC_METADATA_KEYS = [
     "beamline", "devgroup", "devtype", "host", "ioc_version",
     "ca_server_port", "pva_server_port", "pva", "asset", "zone",
-    "ioc_start_time", "iocprefix", "template", "zones", "server", "desc"
+    "ioc_start_time", "iocprefix", "iocroot", "template", "zones", "server", "desc"
 ]
 
 
@@ -388,6 +388,23 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner,
     if "desc" not in ioc_meta and "description" in values_entry:
         ioc_meta["desc"] = str(values_entry["description"])
 
+    # Compute 'device' property from iocprefix[:iocroot][:device_name].
+    # iocprefix and iocroot are popped here — not stored as CF properties directly.
+    iocprefix = ioc_meta.pop("iocprefix", "") or values_entry.get("iocprefix", "")
+    iocroot = ioc_meta.pop("iocroot", "") or values_entry.get("iocroot", "")
+    devices_list = values_entry.get("devices", [])
+    default_device = f"{iocprefix}:{iocroot}" if (iocprefix and iocroot) else iocprefix
+    if devices_list:
+        device_prefix_map = []
+        for dev in devices_list:
+            dev_name = dev.get("name", "") if isinstance(dev, dict) else str(dev)
+            if dev_name and iocprefix:
+                device_prefix_map.append((f"{iocprefix}:{dev_name}:", f"{iocprefix}:{dev_name}"))
+        # Sort longest prefix first for most-specific match
+        device_prefix_map.sort(key=lambda x: len(x[0]), reverse=True)
+    else:
+        device_prefix_map = []
+
     # Timestamp for staleness tracking
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -403,7 +420,7 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner,
     logger.info(f"  IOC {ioc_name}: {len(pv_names)} PVs, meta={ioc_meta}")
 
     # Ensure properties and tags exist in ChannelFinder
-    all_prop_names = set(ioc_meta.keys()) | {"pvProtocol", "lastUpdated", "cfeederVersion"}
+    all_prop_names = set(ioc_meta.keys()) | {"pvProtocol", "lastUpdated", "cfeederVersion", "device"}
     for prop_name in all_prop_names:
         ensure_property(cf_url, prop_name, owner, auth)
 
@@ -437,7 +454,15 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner,
     # Build channel entries
     channels = []
     for pv_name in pv_names:
+        # Determine device: match PV name against device-prefix map, else use IOC default
+        pv_device = default_device
+        for pv_prefix, device_str in device_prefix_map:
+            if pv_name.startswith(pv_prefix):
+                pv_device = device_str
+                break
         properties = [{"name": k, "owner": channel_owner, "value": v} for k, v in ioc_meta.items()]
+        if pv_device:
+            properties.append({"name": "device", "owner": channel_owner, "value": pv_device})
         properties.append({"name": "lastUpdated", "owner": channel_owner, "value": now_iso})
         properties.append({"name": "cfeederVersion", "owner": channel_owner, "value": __version__})
 
