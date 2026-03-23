@@ -1,15 +1,20 @@
 ## Andrea Michelotti
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 import argparse
 import os
-import subprocess
 import requests
 import yaml
 import logging
 import time
 from datetime import datetime, timezone, timedelta
+
+try:
+    from p4p.client.thread import Context as PvaContext
+    _has_p4p = True
+except ImportError:
+    _has_p4p = False
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)-8s %(message)s',
@@ -22,7 +27,7 @@ logger = logging.getLogger(__name__)
 IOC_METADATA_KEYS = [
     "beamline", "devgroup", "devtype", "host", "ioc_version",
     "ca_server_port", "pva_server_port", "pva", "asset", "zone",
-    "ioc_start_time", "iocprefix"
+    "ioc_start_time", "iocprefix", "template", "zones", "server", "desc"
 ]
 
 
@@ -71,39 +76,30 @@ def post_channels(cf_url, channels, auth):
 
 
 # ---------------------------------------------------------------------------
-# PVA introspection via pvinfo (EPICS base CLI)
+# PVA introspection via p4p
 # ---------------------------------------------------------------------------
 
-def pvinfo(pv_name, timeout=0.5):
-    """Run pvinfo on a PV and return parsed structure info as a dict.
-    Returns None if pvinfo fails or is unavailable."""
-    try:
-        result = subprocess.run(
-            ["pvinfo", "-w", str(timeout), pv_name],
-            capture_output=True, text=True, timeout=timeout + 2)
-        if result.returncode == 0 and result.stdout.strip():
-            return {"pvinfo": result.stdout.strip()}
-    except FileNotFoundError:
-        logger.debug("pvinfo command not found, skipping PVA introspection")
-    except subprocess.TimeoutExpired:
-        logger.debug(f"pvinfo timed out for {pv_name}")
-    except Exception as e:
-        logger.debug(f"pvinfo error for {pv_name}: {e}")
-    return None
+_pva_ctx = None
+
+def _get_pva_context():
+    """Lazy-init a shared PVA context."""
+    global _pva_ctx
+    if _pva_ctx is None and _has_p4p:
+        _pva_ctx = PvaContext('pva')
+    return _pva_ctx
 
 
-def pvget_structure(pv_name, timeout=3):
-    """Run pvget -r '' to retrieve full PV structure via PVA.
-    Returns structure string or None."""
+def check_pva(pv_name, timeout=0.5):
+    """Check if a PV is reachable via PVA using p4p.
+    Returns True if the PV responds via PVA, False otherwise."""
+    ctx = _get_pva_context()
+    if ctx is None:
+        return False
     try:
-        result = subprocess.run(
-            ["pvget", "-r", "", "-w", str(timeout), pv_name],
-            capture_output=True, text=True, timeout=timeout + 2)
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
-        pass
-    return None
+        ctx.get(pv_name, timeout=timeout)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -182,15 +178,55 @@ def load_pvlist(pvlist_dir, ioc_name):
 # Values.yaml parsing — extract IOC names
 # ---------------------------------------------------------------------------
 
-def load_ioc_names_from_values(values_yaml_path):
-    """Extract IOC names from the iocDefaults section of values.yaml.
-    Returns a list of IOC type names (keys under iocDefaults)."""
+def load_values_yaml(values_yaml_path):
+    """Parse values.yaml and return (ioc_defaults_dict, iocs_by_name_dict).
+
+    ioc_defaults: dict keyed by template/devtype name with default metadata.
+    iocs_by_name: dict keyed by IOC name with the per-IOC entry from the iocs list,
+                  already merged with its matching iocDefault.
+    """
     with open(values_yaml_path, 'r') as f:
         data = yaml.safe_load(f) or {}
+
     ioc_defaults = data.get("iocDefaults", {})
-    if not ioc_defaults:
-        logger.warning("No iocDefaults found in values.yaml")
-    return ioc_defaults
+    epics_config = data.get("epicsConfiguration", {})
+    iocs_list = epics_config.get("iocs", []) if isinstance(epics_config, dict) else []
+    beamline = data.get("beamline", "")
+
+    iocs_by_name = {}
+    for ioc_entry in iocs_list:
+        name = ioc_entry.get("name")
+        if not name:
+            continue
+        # Start with a copy of matching iocDefault (by template or devtype)
+        merged = {}
+        template = ioc_entry.get("template", "")
+        devtype = ioc_entry.get("devtype", "")
+        for key in [template, devtype]:
+            if key and key in ioc_defaults:
+                merged.update(ioc_defaults[key])
+                break
+        # Overlay the per-IOC entry (takes precedence)
+        merged.update(ioc_entry)
+        # Normalize zones to comma-separated string
+        zones_val = merged.get("zones")
+        if isinstance(zones_val, list):
+            merged["zones"] = ",".join(str(z) for z in zones_val)
+        elif zones_val is not None:
+            merged["zones"] = str(zones_val)
+        # Propagate beamline from top level if not set
+        if beamline and "beamline" not in merged:
+            merged["beamline"] = beamline
+        # Extract server from iocparam if not a direct key
+        if "server" not in merged:
+            for p in merged.get("iocparam", []):
+                if isinstance(p, dict) and p.get("name") == "server" and p.get("value"):
+                    merged["server"] = p["value"]
+                    break
+        iocs_by_name[name] = merged
+
+    logger.info(f"Loaded {len(ioc_defaults)} IOC defaults, {len(iocs_by_name)} IOC entries from {values_yaml_path}")
+    return ioc_defaults, iocs_by_name
 
 
 def get_ioc_dirs(pvlist_dir):
@@ -207,6 +243,41 @@ def get_ioc_dirs(pvlist_dir):
 
 
 # ---------------------------------------------------------------------------
+# Paginated channel query helper
+# ---------------------------------------------------------------------------
+
+PAGE_SIZE = 10000
+
+def fetch_all_channels(cf_url, auth, extra_params=None):
+    """Fetch all channels from ChannelFinder using pagination (max 10000 per page).
+    Uses scroll-style pagination: fetch a page, then use ~from for next page.
+    Falls back to single page if ~from is not supported."""
+    all_channels = []
+    offset = 0
+    while True:
+        params = {"~size": PAGE_SIZE}
+        if offset > 0:
+            params["~from"] = offset
+        if extra_params:
+            params.update(extra_params)
+        r = requests.get(f"{cf_url}/resources/channels", params=params, auth=auth)
+        if r.status_code != 200:
+            if offset > 0:
+                logger.warning(f"Pagination stopped at offset {offset} (server returned {r.status_code})")
+                break
+            logger.error(f"Failed to query channels: {r.status_code} {r.text}")
+            break
+        page = r.json()
+        if not page:
+            break
+        all_channels.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return all_channels
+
+
+# ---------------------------------------------------------------------------
 # Cleanup stale channels
 # ---------------------------------------------------------------------------
 
@@ -217,13 +288,7 @@ def cleanup_stale_channels(cf_url, auth, max_age_days):
     cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
     logger.info(f"Cleanup: removing channels with lastUpdated before {cutoff.isoformat()}")
 
-    # Query all channels that have the lastUpdated property (wildcard value match)
-    r = requests.get(f"{cf_url}/resources/channels", params={"lastUpdated": "*", "~size": 100000}, auth=auth)
-    if r.status_code != 200:
-        logger.error(f"Failed to query channels for cleanup: {r.status_code} {r.text}")
-        return
-
-    channels = r.json()
+    channels = fetch_all_channels(cf_url, auth, {"lastUpdated": "*"})
     stale_count = 0
     for ch in channels:
         last_updated_val = None
@@ -255,29 +320,24 @@ def cleanup_channels_without_timestamp(cf_url, auth):
     These are legacy entries created before cfeeder v2.0.0."""
     logger.info("Cleanup: removing channels without lastUpdated property")
 
-    # Get all channels (up to 100k)
-    r = requests.get(f"{cf_url}/resources/channels", params={"~size": 100000}, auth=auth)
-    if r.status_code != 200:
-        logger.error(f"Failed to query channels: {r.status_code} {r.text}")
-        return
-
-    all_channels = r.json()
+    all_channels = fetch_all_channels(cf_url, auth)
 
     # Get channels that DO have lastUpdated
-    r2 = requests.get(f"{cf_url}/resources/channels", params={"lastUpdated": "*", "~size": 100000}, auth=auth)
-    has_timestamp = set()
-    if r2.status_code == 200:
-        has_timestamp = {ch["name"] for ch in r2.json()}
+    has_timestamp = {ch["name"] for ch in fetch_all_channels(cf_url, auth, {"lastUpdated": "*"})}
+
+    to_remove = [ch for ch in all_channels if ch["name"] not in has_timestamp]
+    logger.info(f"Found {len(all_channels)} total channels, {len(has_timestamp)} with lastUpdated, "
+                f"{len(to_remove)} to remove")
 
     removed = 0
-    for ch in all_channels:
-        if ch["name"] not in has_timestamp:
-            dr = requests.delete(f"{cf_url}/resources/channels/{ch['name']}", auth=auth)
-            if dr.status_code == 200:
-                removed += 1
-                logger.debug(f"Deleted channel without lastUpdated: {ch['name']}")
-            else:
-                logger.error(f"Failed to delete {ch['name']}: {dr.status_code} {dr.text}")
+    for ch in to_remove:
+        dr = requests.delete(f"{cf_url}/resources/channels/{ch['name']}", auth=auth)
+        if dr.status_code == 200:
+            removed += 1
+            if removed % 500 == 0:
+                logger.info(f"  ...deleted {removed}/{len(to_remove)} channels")
+        else:
+            logger.error(f"Failed to delete {ch['name']}: {dr.status_code} {dr.text}")
 
     logger.info(f"Cleanup complete: deleted {removed} channel(s) without lastUpdated")
 
@@ -286,21 +346,28 @@ def cleanup_channels_without_timestamp(cf_url, auth):
 # Main processing
 # ---------------------------------------------------------------------------
 
-def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
-                use_pva=True, pva_timeout=3, batch_size=100):
+def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner, auth,
+                use_pva=True, pva_timeout=0.5, batch_size=100):
     """Process a single IOC: read metadata, pvlist, attempt PVA introspection, feed CF."""
     logger.info(f"Processing IOC: {ioc_name}")
 
     # Load IOC metadata from the per-IOC config yaml
     ioc_meta = load_ioc_metadata(pvlist_dir, ioc_name)
 
-    # Merge metadata from values.yaml iocDefaults if the IOC's devtype matches
-    devtype = ioc_meta.get("devtype", "")
-    for default_key, default_vals in ioc_defaults.items():
-        if default_key == devtype or default_key == ioc_name:
-            for k in IOC_METADATA_KEYS:
-                if k not in ioc_meta and k in default_vals and default_vals[k] is not None:
-                    ioc_meta[k] = str(default_vals[k])
+    # Merge metadata from values.yaml iocs entry (already merged with iocDefaults)
+    values_entry = iocs_by_name.get(ioc_name, {})
+    for k in IOC_METADATA_KEYS:
+        if k not in ioc_meta and k in values_entry and values_entry[k] is not None:
+            ioc_meta[k] = str(values_entry[k])
+
+    # Fallback: try matching by devtype in iocDefaults (for IOCs not in iocs list)
+    if not values_entry:
+        devtype = ioc_meta.get("devtype", "")
+        for default_key, default_vals in ioc_defaults.items():
+            if default_key == devtype or default_key == ioc_name:
+                for k in IOC_METADATA_KEYS:
+                    if k not in ioc_meta and k in default_vals and default_vals[k] is not None:
+                        ioc_meta[k] = str(default_vals[k])
 
     # Merge start.log data — overrides yaml for ioc_version, adds ioc_start_time
     start_log = parse_start_log(pvlist_dir, ioc_name)
@@ -308,6 +375,10 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
 
     # Always set iocName property
     ioc_meta["iocName"] = ioc_name
+
+    # Use desc from values.yaml if present
+    if "desc" not in ioc_meta and "description" in values_entry:
+        ioc_meta["desc"] = str(values_entry["description"])
 
     # Timestamp for staleness tracking
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -328,7 +399,7 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
     for prop_name in all_prop_names:
         ensure_property(cf_url, prop_name, owner, auth)
 
-    # Tag with IOC name, devgroup, beamline, and zone
+    # Tag with IOC name, devgroup, beamline, zone, and zones
     tags = [ioc_name]
     if "devgroup" in ioc_meta:
         tags.append(ioc_meta["devgroup"])
@@ -336,8 +407,24 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
         tags.append(ioc_meta["beamline"])
     if "zone" in ioc_meta:
         tags.append(ioc_meta["zone"])
+    if "zones" in ioc_meta:
+        for z in ioc_meta["zones"].split(","):
+            z = z.strip()
+            if z and z not in tags:
+                tags.append(z)
+    if "template" in ioc_meta and ioc_meta["template"] not in tags:
+        tags.append(ioc_meta["template"])
     for tag in tags:
         ensure_tag(cf_url, tag, owner, auth)
+
+    # Check PVA once for first PV of the IOC to determine protocol
+    ioc_is_pva = False
+    if use_pva and ioc_meta.get("pva", "").lower() != "false":
+        # Test first PV to determine if the IOC supports PVA
+        if pv_names:
+            ioc_is_pva = check_pva(pv_names[0], timeout=pva_timeout)
+            if ioc_is_pva:
+                logger.info(f"  IOC {ioc_name}: PVA detected (tested {pv_names[0]})")
 
     # Build channel entries
     channels = []
@@ -346,16 +433,7 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
         properties.append({"name": "lastUpdated", "owner": channel_owner, "value": now_iso})
         properties.append({"name": "cfeederVersion", "owner": channel_owner, "value": __version__})
 
-        # Try PVA introspection — protocol is pva if pvinfo succeeds, ca otherwise
-        # Skip only when pva is explicitly set to false in IOC metadata
-        pv_protocol = "ca"
-        if use_pva and ioc_meta.get("pva", "").lower() != "false":
-            info = pvinfo(pv_name, timeout=pva_timeout)
-            if info:
-                pv_protocol = "pva"
-                properties.append({"name": "pvinfo", "owner": channel_owner, "value": info["pvinfo"][:500]})
-                ensure_property(cf_url, "pvinfo", owner, auth)
-
+        pv_protocol = "pva" if ioc_is_pva else "ca"
         properties.append({"name": "pvProtocol", "owner": channel_owner, "value": pv_protocol})
 
         channel = {
@@ -375,7 +453,7 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, cf_url, owner, auth,
     if channels:
         post_channels(cf_url, channels, auth)
 
-    logger.info(f"  Done: {ioc_name} ({len(pv_names)} PVs)")
+    logger.info(f"  Done: {ioc_name} ({len(pv_names)} PVs, protocol={'pva' if ioc_is_pva else 'ca'})")
 
 
 def main():
@@ -398,7 +476,7 @@ def main():
     parser.add_argument('--no-pva', action='store_true',
                         help='Skip PVA introspection even if IOC supports it')
     parser.add_argument('--pva-timeout', type=float, default=0.5,
-                        help='Timeout in seconds for pvinfo (default: 0.5)')
+                        help='Timeout in seconds for PVA check (default: 0.5)')
     parser.add_argument('--batch-size', type=int, default=100,
                         help='Number of channels per POST batch (default: 100)')
     parser.add_argument('--cleanup-days', type=int, default=None,
@@ -423,11 +501,11 @@ def main():
             logger.warning("--cleanup-only requires --cleanup-days N or --remove-no-timestamp")
         return
 
-    # Load iocDefaults from values.yaml if provided
+    # Load values.yaml if provided
     ioc_defaults = {}
+    iocs_by_name = {}
     if args.values_yaml:
-        ioc_defaults = load_ioc_names_from_values(args.values_yaml)
-        logger.info(f"Loaded {len(ioc_defaults)} IOC defaults from {args.values_yaml}")
+        ioc_defaults, iocs_by_name = load_values_yaml(args.values_yaml)
 
     # Determine which IOCs to process
     if args.ioc:
@@ -443,6 +521,7 @@ def main():
                 ioc_name=ioc_name,
                 pvlist_dir=args.pvlist_dir,
                 ioc_defaults=ioc_defaults,
+                iocs_by_name=iocs_by_name,
                 cf_url=args.cf_service_url,
                 owner=args.username,
                 auth=auth,
