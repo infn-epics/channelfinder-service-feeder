@@ -397,9 +397,18 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner,
     if devices_list:
         device_prefix_map = []
         for dev in devices_list:
-            dev_name = dev.get("name", "") if isinstance(dev, dict) else str(dev)
+            if isinstance(dev, dict):
+                dev_name = dev.get("name", "")
+                dev_devtype = dev.get("devtype")
+            else:
+                dev_name = str(dev)
+                dev_devtype = None
             if dev_name and iocprefix:
-                device_prefix_map.append((f"{iocprefix}:{dev_name}:", f"{iocprefix}:{dev_name}"))
+                device_prefix_map.append((
+                    f"{iocprefix}:{dev_name}:",
+                    f"{iocprefix}:{dev_name}",
+                    dev_devtype,
+                ))
         # Sort longest prefix first for most-specific match
         device_prefix_map.sort(key=lambda x: len(x[0]), reverse=True)
     else:
@@ -456,11 +465,18 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner,
     for pv_name in pv_names:
         # Determine device: match PV name against device-prefix map, else use IOC default
         pv_device = default_device
-        for pv_prefix, device_str in device_prefix_map:
+        pv_devtype_override = None
+        for pv_prefix, device_str, device_devtype in device_prefix_map:
             if pv_name.startswith(pv_prefix):
                 pv_device = device_str
+                pv_devtype_override = device_devtype
                 break
-        properties = [{"name": k, "owner": channel_owner, "value": v} for k, v in ioc_meta.items()]
+
+        pv_meta = dict(ioc_meta)
+        if pv_devtype_override not in (None, ""):
+            pv_meta["devtype"] = str(pv_devtype_override)
+
+        properties = [{"name": k, "owner": channel_owner, "value": v} for k, v in pv_meta.items()]
         if pv_device:
             properties.append({"name": "device", "owner": channel_owner, "value": pv_device})
         properties.append({"name": "lastUpdated", "owner": channel_owner, "value": now_iso})

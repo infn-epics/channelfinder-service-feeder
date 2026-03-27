@@ -56,7 +56,7 @@ python cfeeder.py /Volumes/data_epik8s/config http://localhost:8080/ChannelFinde
 Each PV channel is created with these properties (when available):
 
 - `iocName` — IOC directory name
-- `beamline`, `devgroup`, `devtype` — from IOC config
+- `beamline`, `devgroup`, `devtype` — from IOC config (`devices[].devtype` overrides IOC `devtype` for matching device PVs)
 - `host` — IOC hostname
 - `ioc_version` — IOC software version
 - `ca_server_port`, `pva_server_port` — EPICS ports
