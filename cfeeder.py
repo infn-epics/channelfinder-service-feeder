@@ -1,6 +1,6 @@
 ## Andrea Michelotti
 
-__version__ = "2.1.2"
+__version__ = "2.1.4"
 
 import argparse
 import os
@@ -186,26 +186,42 @@ def load_pvlist(pvlist_dir, ioc_name):
 # Values.yaml parsing — extract IOC names
 # ---------------------------------------------------------------------------
 
+def iter_ioc_entries(iocs):
+    """Yield (name, entry) for every IOC in epicsConfiguration.iocs.
+
+    epik8s beamline repos now key `iocs` by IOC name (a mapping); the legacy
+    form was a list of entries each carrying its own `name`. Both are accepted
+    so an old values.yaml keeps working. Iterating a mapping directly yields
+    only its string keys, which used to crash the whole run at startup.
+    """
+    if isinstance(iocs, dict):
+        for key, entry in iocs.items():
+            if isinstance(entry, dict):
+                yield (entry.get("name") or key), entry
+    elif isinstance(iocs, list):
+        for entry in iocs:
+            if isinstance(entry, dict) and entry.get("name"):
+                yield entry["name"], entry
+
+
 def load_values_yaml(values_yaml_path):
     """Parse values.yaml and return (ioc_defaults_dict, iocs_by_name_dict).
 
     ioc_defaults: dict keyed by template/devtype name with default metadata.
-    iocs_by_name: dict keyed by IOC name with the per-IOC entry from the iocs list,
-                  already merged with its matching iocDefault.
+    iocs_by_name: dict keyed by IOC name with the per-IOC entry from `iocs`
+                  (mapping or legacy list), already merged with its matching
+                  iocDefault.
     """
     with open(values_yaml_path, 'r') as f:
         data = yaml.safe_load(f) or {}
 
-    ioc_defaults = data.get("iocDefaults", {})
-    epics_config = data.get("epicsConfiguration", {})
-    iocs_list = epics_config.get("iocs", []) if isinstance(epics_config, dict) else []
+    ioc_defaults = data.get("iocDefaults") or {}
+    epics_config = data.get("epicsConfiguration") or {}
+    iocs_raw = epics_config.get("iocs") if isinstance(epics_config, dict) else None
     beamline = data.get("beamline", "")
 
     iocs_by_name = {}
-    for ioc_entry in iocs_list:
-        name = ioc_entry.get("name")
-        if not name:
-            continue
+    for name, ioc_entry in iter_ioc_entries(iocs_raw):
         # Start with a copy of matching iocDefault (by template or devtype)
         merged = {}
         template = ioc_entry.get("template", "")
@@ -216,6 +232,7 @@ def load_values_yaml(values_yaml_path):
                 break
         # Overlay the per-IOC entry (takes precedence)
         merged.update(ioc_entry)
+        merged.setdefault("name", name)
         # Normalize zones to comma-separated string
         zones_val = merged.get("zones")
         if isinstance(zones_val, list):
