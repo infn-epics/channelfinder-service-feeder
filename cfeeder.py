@@ -1,6 +1,6 @@
 ## Andrea Michelotti
 
-__version__ = "2.1.4"
+__version__ = "2.1.5"
 
 import argparse
 import os
@@ -204,16 +204,30 @@ def iter_ioc_entries(iocs):
                 yield entry["name"], entry
 
 
-def load_values_yaml(values_yaml_path):
-    """Parse values.yaml and return (ioc_defaults_dict, iocs_by_name_dict).
+def _merge_values(base, override):
+    """Merge Helm values: maps combine recursively; later values replace others."""
+    for key, value in override.items():
+        if isinstance(base.get(key), dict) and isinstance(value, dict):
+            _merge_values(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def load_values_yaml(values_yaml_paths):
+    """Parse one or more Helm values files in order and return IOC metadata.
 
     ioc_defaults: dict keyed by template/devtype name with default metadata.
     iocs_by_name: dict keyed by IOC name with the per-IOC entry from `iocs`
                   (mapping or legacy list), already merged with its matching
                   iocDefault.
     """
-    with open(values_yaml_path, 'r') as f:
-        data = yaml.safe_load(f) or {}
+    if isinstance(values_yaml_paths, (str, os.PathLike)):
+        values_yaml_paths = [values_yaml_paths]
+    data = {}
+    for path in values_yaml_paths:
+        with open(path, 'r') as f:
+            _merge_values(data, yaml.safe_load(f) or {})
 
     ioc_defaults = data.get("iocDefaults") or {}
     epics_config = data.get("epicsConfiguration") or {}
@@ -250,7 +264,7 @@ def load_values_yaml(values_yaml_path):
                     break
         iocs_by_name[name] = merged
 
-    logger.info(f"Loaded {len(ioc_defaults)} IOC defaults, {len(iocs_by_name)} IOC entries from {values_yaml_path}")
+    logger.info(f"Loaded {len(ioc_defaults)} IOC defaults, {len(iocs_by_name)} IOC entries from {values_yaml_paths}")
     return ioc_defaults, iocs_by_name
 
 
@@ -535,8 +549,8 @@ def main():
                         help='ChannelFinder username')
     parser.add_argument('password', type=str,
                         help='ChannelFinder password')
-    parser.add_argument('--values-yaml', type=str, default=None,
-                        help='Path to values.yaml for IOC metadata (optional)')
+    parser.add_argument('--values-yaml', type=str, nargs='+', default=None,
+                        help='Helm values files in deployment order for IOC metadata (optional)')
     parser.add_argument('--ioc', type=str, default=None,
                         help='Process only this IOC name (default: all IOCs with pvlist.txt)')
     parser.add_argument('--no-pva', action='store_true',

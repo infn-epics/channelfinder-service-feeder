@@ -66,6 +66,39 @@ class LoadValuesYamlTest(unittest.TestCase):
             defaults, iocs = load(text)
             self.assertEqual((defaults, iocs), ({}, {}))
 
+    def test_multiple_files_merge_like_helm(self):
+        files = []
+        try:
+            for content in (
+                """beamline: BTF
+iocDefaults:
+  motor: {devgroup: mot, devtype: motor}
+epicsConfiguration:
+  iocs:
+    base: {template: motor, zones: [BASE]}
+    shared: {template: motor, server: old, zones: [OLD]}
+""",
+                """epicsConfiguration:
+  iocs:
+    extra: {template: motor, devices: [{name: M1}]}
+    shared: {server: new, zones: [NEW]}
+""",
+            ):
+                with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+                    f.write(content)
+                    files.append(f.name)
+            defaults, iocs = cfeeder.load_values_yaml(files)
+            self.assertEqual(defaults["motor"]["devgroup"], "mot")
+            self.assertEqual(set(iocs), {"base", "shared", "extra"})
+            self.assertEqual(iocs["extra"]["devgroup"], "mot")
+            self.assertEqual(iocs["extra"]["beamline"], "BTF")
+            self.assertEqual(iocs["shared"]["server"], "new")
+            self.assertEqual(iocs["shared"]["zones"], "NEW")
+            self.assertEqual(iocs["shared"]["template"], "motor")
+        finally:
+            for path in files:
+                os.unlink(path)
+
 
 if __name__ == "__main__":
     unittest.main()

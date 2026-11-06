@@ -28,6 +28,12 @@ python cfeeder.py /Volumes/data_epik8s/config http://localhost:8080/ChannelFinde
 python cfeeder.py /Volumes/data_epik8s/config http://localhost:8080/ChannelFinder admin adminPass \
     --values-yaml /path/to/deploy/values.yaml
 
+# With all Helm values files, in the same order as the deployment
+python cfeeder.py /Volumes/data_epik8s/config http://localhost:8080/ChannelFinder admin adminPass \
+    --values-yaml /path/to/deploy/values.yaml /path/to/deploy/values-linac.yaml \
+    /path/to/deploy/values-tl.yaml /path/to/deploy/values-accumulator.yaml \
+    /path/to/deploy/values-vac.yaml
+
 # Process a single IOC
 python cfeeder.py /Volumes/data_epik8s/config http://localhost:8080/ChannelFinder admin adminPass \
     --ioc ac1bpm01
@@ -45,7 +51,7 @@ python cfeeder.py /Volumes/data_epik8s/config http://localhost:8080/ChannelFinde
 | `cf_service_url` | ChannelFinder service URL |
 | `username` | ChannelFinder username |
 | `password` | ChannelFinder password |
-| `--values-yaml` | Path to `values.yaml` for `iocDefaults` metadata (optional) |
+| `--values-yaml` | One or more Helm values files in deployment order for IOC metadata (optional) |
 | `--ioc` | Process only this IOC (default: all with pvlist.txt) |
 | `--no-pva` | Skip PVA introspection |
 | `--pva-timeout` | Timeout for pvinfo in seconds (default: 3) |
