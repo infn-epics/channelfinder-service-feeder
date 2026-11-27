@@ -1,6 +1,6 @@
 ## Andrea Michelotti
 
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 
 import argparse
 import os
@@ -263,6 +263,17 @@ def load_values_yaml(values_yaml_paths):
                 if isinstance(p, dict) and p.get("name") == "server" and p.get("value"):
                     merged["server"] = p["value"]
                     break
+        iocs_by_name[name] = merged
+
+    # Standalone soft IOCs (top-level `softiocs`, deployed by epik8s-chart next to
+    # epicsConfiguration.iocs) are configured IOCs too: --only-configured must feed them.
+    softioc_defaults = data.get("softiocDefaults") or {}
+    for name, entry in iter_ioc_entries(data.get("softiocs")):
+        if name in iocs_by_name:
+            continue
+        merged = {**softioc_defaults, **entry, "name": name}
+        if beamline and "beamline" not in merged:
+            merged["beamline"] = beamline
         iocs_by_name[name] = merged
 
     logger.info(f"Loaded {len(ioc_defaults)} IOC defaults, {len(iocs_by_name)} IOC entries from {values_yaml_paths}")

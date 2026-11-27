@@ -100,5 +100,26 @@ epicsConfiguration:
                 os.unlink(path)
 
 
+class SoftIocsTest(unittest.TestCase):
+    def test_softiocs_are_configured_iocs(self):
+        _, iocs = load("""
+            beamline: SPARC
+            epicsConfiguration:
+              iocs:
+                cam-01: {name: cam-01}
+            softiocDefaults: {devgroup: global}
+            softiocs:
+              - name: softinterlock
+                iocprefix: SPARC:SOFTINTLK
+              - name: cam-01
+                devgroup: other
+        """)
+        self.assertEqual(sorted(iocs), ["cam-01", "softinterlock"])
+        self.assertEqual(iocs["softinterlock"]["devgroup"], "global")  # from softiocDefaults
+        self.assertEqual(iocs["softinterlock"]["beamline"], "SPARC")
+        self.assertNotIn("devgroup", iocs["cam-01"])  # an iocs entry wins over a softioc of the same name
+        self.assertEqual(cfeeder.configured_ioc_names(iocs), {"cam-01", "softinterlock"})
+
+
 if __name__ == "__main__":
     unittest.main()

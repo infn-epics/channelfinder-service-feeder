@@ -59,7 +59,7 @@ python cfeeder.py /Volumes/data_epik8s/config http://localhost:8080/ChannelFinde
 | `--cleanup-days` | Delete channels with `lastUpdated` older than N days |
 | `--remove-no-timestamp` | Delete channels that have no `lastUpdated` property |
 | `--cleanup-only` | Only run the cleanup passes, do not feed |
-| `--only-configured` | Feed only the IOCs listed (and not disabled) in `--values-yaml`; directories of removed IOCs on the config share are ignored |
+| `--only-configured` | Feed only the IOCs listed (and not disabled) in `--values-yaml` - `epicsConfiguration.iocs` and the standalone `softiocs` - ignoring directories of removed IOCs on the config share |
 | `--prune` | After feeding, delete the feeder's channels that are in no fed IOC's `pvlist.txt` |
 | `--prune-max-fraction` | Refuse to prune when it would delete more than this fraction of the channels (default: 0.5) |
 | `--dry-run` | With `--prune`: feed and delete nothing, log what would be deleted per IOC |
