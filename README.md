@@ -56,6 +56,32 @@ python cfeeder.py /Volumes/data_epik8s/config http://localhost:8080/ChannelFinde
 | `--no-pva` | Skip PVA introspection |
 | `--pva-timeout` | Timeout for pvinfo in seconds (default: 3) |
 | `--batch-size` | Channels per POST batch (default: 100) |
+| `--cleanup-days` | Delete channels with `lastUpdated` older than N days |
+| `--remove-no-timestamp` | Delete channels that have no `lastUpdated` property |
+| `--cleanup-only` | Only run the cleanup passes, do not feed |
+| `--only-configured` | Feed only the IOCs listed (and not disabled) in `--values-yaml`; directories of removed IOCs on the config share are ignored |
+| `--prune` | After feeding, delete the feeder's channels that are in no fed IOC's `pvlist.txt` |
+| `--prune-max-fraction` | Refuse to prune when it would delete more than this fraction of the channels (default: 0.5) |
+| `--dry-run` | With `--prune`: feed and delete nothing, log what would be deleted per IOC |
+
+## Keeping ChannelFinder free of stale PVs
+
+The config share keeps the directory of every IOC that ever ran, so feeding every
+directory re-posts removed and renamed IOCs each night with a fresh `lastUpdated`;
+and since IOCs are fed in alphabetical order, an old directory can overwrite the
+properties of the live IOC that now serves the same PVs. Run the feeder with
+
+```bash
+python cfeeder.py /nfs/config http://channelfinder:8080/ChannelFinder epics pass \
+    --values-yaml deploy/values.yaml --only-configured --prune
+```
+
+to feed only the configured IOCs and then delete every channel no configured IOC
+publishes (by PV name, so a live PV relabelled by an old IOC is kept). IOCs configured
+without a `pvlist.txt` keep their channels; channels owned by another user are never
+touched; a prune that would delete more than `--prune-max-fraction` of the channels is
+refused. Add `--dry-run` first to see what would go. Channels are read through the
+scroll API, so the cleanup passes see all channels, not only the first 10000.
 
 ## Channel Properties
 

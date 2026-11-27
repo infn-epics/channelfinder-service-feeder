@@ -1,6 +1,6 @@
 ## Andrea Michelotti
 
-__version__ = "2.1.5"
+__version__ = "2.2.0"
 
 import argparse
 import os
@@ -9,6 +9,7 @@ import yaml
 import logging
 import time
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 try:
     from p4p.client.thread import Context as PvaContext
@@ -288,9 +289,33 @@ def get_ioc_dirs(pvlist_dir):
 PAGE_SIZE = 10000
 
 def fetch_all_channels(cf_url, auth, extra_params=None):
-    """Fetch all channels from ChannelFinder using pagination (max 10000 per page).
-    Uses scroll-style pagination: fetch a page, then use ~from for next page.
-    Falls back to single page if ~from is not supported."""
+    """Fetch every channel matching extra_params (all channels by default).
+
+    Reads through ChannelFinder's scroll API: ~from paging stops at 10000
+    channels (Elasticsearch refuses from+size beyond that), which left every
+    channel after the first 10000 unseen by the cleanup passes. Older servers
+    without /resources/scroll fall back to ~from paging.
+    """
+    params = {"~name": "*", **(extra_params or {}), "~size": PAGE_SIZE}
+    r = requests.get(f"{cf_url}/resources/scroll", params=params, auth=auth)
+    if r.status_code == 200:
+        all_channels = []
+        page = r.json()
+        while page.get("channels"):
+            all_channels.extend(page["channels"])
+            if not page.get("id"):
+                break
+            r = requests.get(f"{cf_url}/resources/scroll/{page['id']}", params=params, auth=auth)
+            if r.status_code != 200:
+                raise RuntimeError(f"ChannelFinder scroll failed after {len(all_channels)} channels: "
+                                   f"{r.status_code} {r.text}")
+            page = r.json()
+        return all_channels
+    logger.warning(f"Scroll API unavailable ({r.status_code}); paging with ~from (at most {PAGE_SIZE} channels)")
+    return _fetch_channels_by_offset(cf_url, auth, extra_params)
+
+
+def _fetch_channels_by_offset(cf_url, auth, extra_params=None):
     all_channels = []
     offset = 0
     while True:
@@ -379,6 +404,89 @@ def cleanup_channels_without_timestamp(cf_url, auth):
             logger.error(f"Failed to delete {ch['name']}: {dr.status_code} {dr.text}")
 
     logger.info(f"Cleanup complete: deleted {removed} channel(s) without lastUpdated")
+
+
+# ---------------------------------------------------------------------------
+# Configured IOCs and pruning
+# ---------------------------------------------------------------------------
+
+def _is_disabled(entry):
+    return bool(entry.get("disable") or entry.get("disabled")) or entry.get("enabled") is False
+
+
+def configured_ioc_names(iocs_by_name):
+    """Lower-case names of the IOCs the values files deploy (disabled ones left out)."""
+    return {name.lower() for name, entry in iocs_by_name.items() if not _is_disabled(entry)}
+
+
+def select_configured(ioc_dirs, iocs_by_name):
+    """The IOC directories that belong to a configured IOC, and the configured IOCs with no directory.
+
+    Directories of removed or renamed IOCs stay on the config share for good; feeding them
+    every night keeps their PVs in ChannelFinder with a fresh lastUpdated, and - fed in
+    alphabetical order - lets them overwrite the properties of a live IOC serving the same PVs.
+    """
+    configured = configured_ioc_names(iocs_by_name)
+    selected = [d for d in ioc_dirs if d.lower() in configured]
+    missing = sorted(configured - {d.lower() for d in selected})
+    return selected, missing
+
+
+def prune_channels(cf_url, auth, owner, keep_names, keep_iocs=(), max_fraction=0.5, dry_run=False):
+    """Delete this feeder's channels that no fed IOC publishes any more.
+
+    keep_names: every PV name in the pvlist.txt of the IOCs fed in this run.
+    keep_iocs:  IOCs whose channels are kept as they are, because this run could not
+                read their PV list (configured but no pvlist.txt).
+    A channel goes when its name is in no fed pvlist - by name, not by iocName, because
+    a stale IOC may have relabelled a live PV. Only channels owned by `owner` are touched.
+    Refuses (deletes nothing) when it would remove more than max_fraction of the channels,
+    so an empty config share or a wrong values file cannot wipe ChannelFinder.
+    Returns the names of the channels it deleted (or, with dry_run, would delete).
+    """
+    if not keep_names:
+        logger.error("Prune skipped: no PV was read from any pvlist.txt, so nothing can be told stale")
+        return []
+    keep_iocs = {i.lower() for i in keep_iocs}
+    channels = fetch_all_channels(cf_url, auth)
+    stale, by_ioc = [], {}
+    for ch in channels:
+        if ch.get("owner") != owner or ch["name"] in keep_names:
+            continue
+        ioc = next((p.get("value", "") for p in ch.get("properties", []) if p["name"] == "iocName"), "")
+        if ioc.lower() in keep_iocs:
+            continue
+        stale.append(ch["name"])
+        by_ioc[ioc or "?"] = by_ioc.get(ioc or "?", 0) + 1
+
+    logger.info(f"Prune: {len(stale)} of {len(channels)} channel(s) are in no fed pvlist")
+    for ioc, count in sorted(by_ioc.items()):
+        logger.info(f"  {ioc}: {count}")
+    if not stale:
+        return []
+    fraction = len(stale) / len(channels)
+    if fraction > max_fraction and not dry_run:
+        logger.error(f"Prune refused: it would delete {fraction:.0%} of the channels, more than "
+                     f"--prune-max-fraction {max_fraction:.0%}. Check the values files and the config "
+                     f"share, then rerun with a higher --prune-max-fraction if this is intended.")
+        return []
+    if dry_run:
+        logger.info("Dry run: nothing deleted")
+        return stale
+
+    session = requests.Session()
+    session.auth = auth
+    removed = []
+    for name in stale:
+        dr = session.delete(f"{cf_url}/resources/channels/{quote(name, safe=':')}")
+        if dr.status_code == 200:
+            removed.append(name)
+            if len(removed) % 1000 == 0:
+                logger.info(f"  ...deleted {len(removed)}/{len(stale)} channels")
+        else:
+            logger.error(f"Failed to delete {name}: {dr.status_code} {dr.text}")
+    logger.info(f"Prune complete: deleted {len(removed)} channel(s)")
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -565,16 +673,35 @@ def main():
                         help='Delete channels that have no lastUpdated property')
     parser.add_argument('--cleanup-only', action='store_true',
                         help='Only run cleanup, do not feed channels')
+    parser.add_argument('--only-configured', action='store_true',
+                        help='Feed only the IOCs listed (and not disabled) in --values-yaml; '
+                             'directories of removed IOCs on the config share are ignored')
+    parser.add_argument('--prune', action='store_true',
+                        help='After feeding, delete the channels that are in no fed IOC pvlist.txt')
+    parser.add_argument('--prune-max-fraction', type=float, default=0.5,
+                        help='Refuse to prune when it would delete more than this fraction of the '
+                             'channels (default: 0.5)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Feed and delete nothing: report what --prune would delete')
 
     args = parser.parse_args()
     auth = (args.username, args.password)
 
     logger.info(f"cfeeder version {__version__}")
 
+    if args.only_configured and not args.values_yaml:
+        parser.error("--only-configured needs --values-yaml")
+    if args.prune and args.ioc:
+        parser.error("--prune needs every IOC's PV list; it cannot be used with --ioc")
+    if args.dry_run and not args.prune:
+        parser.error("--dry-run reports what --prune would delete; add --prune")
+
     # Cleanup passes
-    if args.remove_no_timestamp:
+    if args.dry_run and (args.remove_no_timestamp or args.cleanup_days is not None):
+        logger.warning("Dry run: the --remove-no-timestamp and --cleanup-days passes are skipped")
+    elif args.remove_no_timestamp:
         cleanup_channels_without_timestamp(args.cf_service_url, auth)
-    if args.cleanup_days is not None:
+    if args.cleanup_days is not None and not args.dry_run:
         cleanup_stale_channels(args.cf_service_url, auth, args.cleanup_days)
     if args.cleanup_only:
         if not args.cleanup_days and not args.remove_no_timestamp:
@@ -593,9 +720,24 @@ def main():
     else:
         ioc_names = get_ioc_dirs(args.pvlist_dir)
 
-    logger.info(f"Processing {len(ioc_names)} IOC(s) from {args.pvlist_dir}")
+    missing = []
+    if args.only_configured:
+        all_dirs = ioc_names
+        ioc_names, missing = select_configured(ioc_names, iocs_by_name)
+        ignored = sorted(set(all_dirs) - set(ioc_names))
+        if ignored:
+            logger.info(f"Ignoring {len(ignored)} IOC directory(ies) not in the values files: {', '.join(ignored)}")
+        if missing and not args.ioc:
+            logger.warning(f"Configured IOC(s) with no pvlist.txt (channels kept as they are): {', '.join(missing)}")
 
-    for ioc_name in ioc_names:
+    if args.dry_run:
+        logger.info(f"Dry run: not feeding {len(ioc_names)} IOC(s)")
+        ioc_names_to_feed = []
+    else:
+        ioc_names_to_feed = ioc_names
+        logger.info(f"Processing {len(ioc_names)} IOC(s) from {args.pvlist_dir}")
+
+    for ioc_name in ioc_names_to_feed:
         try:
             process_ioc(
                 ioc_name=ioc_name,
@@ -611,6 +753,18 @@ def main():
             )
         except Exception as e:
             logger.error(f"Error processing IOC {ioc_name}: {e}", exc_info=True)
+
+    if args.prune:
+        keep_names = set()
+        keep_iocs = list(missing)
+        for ioc_name in ioc_names:
+            pvs = load_pvlist(args.pvlist_dir, ioc_name)
+            if pvs:
+                keep_names.update(pvs)
+            else:
+                keep_iocs.append(ioc_name)
+        prune_channels(args.cf_service_url, auth, args.username, keep_names, keep_iocs,
+                       max_fraction=args.prune_max_fraction, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
