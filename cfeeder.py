@@ -1,6 +1,6 @@
 ## Andrea Michelotti
 
-__version__ = "2.2.1"
+__version__ = "2.2.2"
 
 import argparse
 import os
@@ -62,6 +62,16 @@ def ensure_tag(cf_url, tag_name, owner, auth):
             logger.info(f"Created tag: {tag_name}")
         else:
             logger.error(f"Failed to create tag {tag_name}: {r2.status_code} {r2.text}")
+
+
+def metadata_properties(meta, owner):
+    """ChannelFinder properties for the IOC metadata, leaving out empty values.
+
+    ChannelFinder rejects a whole POST (HTTP 400) when any property value is empty, so an
+    IOC whose values.yaml entry has e.g. `asset: ''` never reached ChannelFinder at all.
+    """
+    return [{"name": k, "owner": owner, "value": str(v)}
+            for k, v in meta.items() if v is not None and str(v).strip() != ""]
 
 
 def post_channels(cf_url, channels, auth):
@@ -579,7 +589,7 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner,
     logger.info(f"  IOC {ioc_name}: {len(pv_names)} PVs, meta={ioc_meta}")
 
     # Ensure properties and tags exist in ChannelFinder
-    all_prop_names = set(ioc_meta.keys()) | {"pvProtocol", "lastUpdated", "cfeederVersion", "device"}
+    all_prop_names = {p["name"] for p in metadata_properties(ioc_meta, owner)} | {"pvProtocol", "lastUpdated", "cfeederVersion", "device"}
     for prop_name in all_prop_names:
         ensure_property(cf_url, prop_name, owner, auth)
 
@@ -598,6 +608,7 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner,
                 tags.append(z)
     if "template" in ioc_meta and ioc_meta["template"] not in tags:
         tags.append(ioc_meta["template"])
+    tags = [t for t in tags if t and str(t).strip()]
     for tag in tags:
         ensure_tag(cf_url, tag, owner, auth)
 
@@ -626,7 +637,7 @@ def process_ioc(ioc_name, pvlist_dir, ioc_defaults, iocs_by_name, cf_url, owner,
         if pv_devtype_override not in (None, ""):
             pv_meta["devtype"] = str(pv_devtype_override)
 
-        properties = [{"name": k, "owner": channel_owner, "value": v} for k, v in pv_meta.items()]
+        properties = metadata_properties(pv_meta, channel_owner)
         if pv_device:
             properties.append({"name": "device", "owner": channel_owner, "value": pv_device})
         properties.append({"name": "lastUpdated", "owner": channel_owner, "value": now_iso})
